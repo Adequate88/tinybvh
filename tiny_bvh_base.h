@@ -6451,17 +6451,103 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 
 			AMDBitWriter writer( &bvh8Data[leafNodeAddr] );
 
+			
+
 			const uint32_t tcount = child->triCount;
-			BVH_FATAL_ERROR_IF( tcount == 0 || tcount > 2,
-				"CWBVH8_AMD_HW::ConvertFrom( .. ), leaf with unsupported triangle count; call BVH::SplitLeafs( 2 ) first." );
-			const uint32_t xBitWidth = 31; // Encoded as vertex bit width minus one.
-			const uint32_t yBitWidth = 31;
-			const uint32_t zBitWidth = 31;
-			const uint32_t trailingZeroes = 0;
+			BVH_FATAL_ERROR_IF( tcount == 0 || tcount > 15,
+				"CWBVH8_AMD_HW::ConvertFrom( .. ), leaf with unsupported triangle count; set triangle limit to 16 first." );
+			
+			// TODO :: Not well optimized
+			// Vertex soup and deduplication
+			bvhvec3 vertSoup[tcount*3];
+			uint32_t idxAssign[tcount*3];
+			for (int i = 0; i < tcount; i++) {
+				const uint32_t triIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri + i];
+				uint32_t ti0, ti1, ti2;
+				if (bvh8.bvh.vertIdx)
+					ti0 = bvh8.bvh.vertIdx[triIdx * 3],
+					ti1 = bvh8.bvh.vertIdx[triIdx * 3 + 1],
+					ti2 = bvh8.bvh.vertIdx[triIdx * 3 + 2];
+				else
+					ti0 = triIdx * 3, ti1 = triIdx * 3 + 1, ti2 = triIdx * 3 + 2;
+
+				int v = i*3;
+				vertSoup[v].x = bvh8.bvh.verts[ti0].x;
+				vertSoup[v].y = bvh8.bvh.verts[ti0].y;
+				vertSoup[v].z = bvh8.bvh.verts[ti0].z;
+
+				vertSoup[v + 1].x = bvh8.bvh.verts[ti1].x;
+				vertSoup[v + 1].y = bvh8.bvh.verts[ti1].y;
+				vertSoup[v + 1].z = bvh8.bvh.verts[ti1].z;
+
+				vertSoup[v + 2].x = bvh8.bvh.verts[ti2].x;
+				vertSoup[v + 2].y = bvh8.bvh.verts[ti2].y;
+				vertSoup[v + 2].z = bvh8.bvh.verts[ti2].z;
+
+				for (int offset = 0; offset < 3; offset++) {
+					for (int j = 0; j < v; j++) { // Vertex already exists?
+						if ( vertSoup[v + offset].x == vertSoup[j].x && vertSoup[v + offset].y == vertSoup[j].y && vertSoup[v + offset].z == vertSoup[j].z) {
+							idxAssign[v + offset] = j;
+						} else {
+							idxAssign[v + offset] = v + offset;
+						}
+					}
+				}
+			}
+
+			// Compute Header Bit Widths and trailing zeroes
+			uint32_t xPrefixBits = 31; // Encoded as vertex bit width minus one.
+			uint32_t yPrefixBits = 31;
+			uint32_t zPrefixBits = 31;
+			uint32_t trailingZeroes = 31;
+			
+			const bvhvec3 refVert = vertSoup[0];
+			for (int i = 1; i < tcount*3; i++) {
+				const bvhvec3 testVert = vertSoup[i];
+
+				uint32_t xTestPrefixBits = __builtin_clz( refVert.x ^ testVert.x ) - 1;
+				uint32_t yTestPrefixBits = __builtin_clz( refVert.y ^ testVert.y ) - 1;
+				uint32_t zTestPrefixBits = __builtin_clz( refVert.z ^ testVert.z ) - 1;
+
+				if (xTestPrefixBits < xPrefixBits) xPrefixBits = xTestPrefixBits;
+				if (yTestPrefixBits < yPrefixBits) yPrefixBits = yTestPrefixBits;
+				if (zTestPrefixBits < zPrefixBits) zPrefixBits = zTestPrefixBits;
+
+				// Trailing zeroes ( shared across all axis)
+				int testTZ = _builtin_ctz(testVert.x) - 1;
+				if (testTZ < trailingZeroes) trailingZeroes = testTZ;
+				testTZ = _builtin_ctz(testVert.y) - 1;
+				if (testTZ < trailingZeroes) trailingZeroes = testTZ;
+				testTZ = _builtin_ctz(testVert.z) - 1;
+				if (testTZ < trailingZeroes) trailingZeroes = testTZ;
+			}
+
+			// Payload Widths
+			const uint32_t xBitWidth = 31 - trailingZeroes - xPrefixBits;
+			const uint32_t yBitWidth = 31 - trailingZeroes - yPrefixBits;
+			const uint32_t zBitWidth = 31 - trailingZeroes - zPrefixBits;
+
+			// Check if it will fit so far:
+			uint32_t pairCount = ( tcount + 1 ) / 2;
+
+			uint32_t dataBits = 1024 - 52 - xPrefixBits - yPrefixBits - zPrefixBits - 29 * pairCount - tcount*3 * (xBitWidth + yBitWidth + zBitWidth); // TODO : This is a conservative and worst case value
+			BVH_FATAL_ERROR_IF( dataBits < 0,
+				"Could not pack triangles in CWBVH8_AMD"); // TODO : Rather than failing this should resort to a fail-safe packing
+
+
 			const uint32_t geomBaseIdx = 0;
-			const uint32_t geomIdx = 0;
-			const uint32_t primBaseIdx = 31;
-			const uint32_t primIdx = 31;
+			const uint32_t geomIdx = 0; // TODO : Currently No TLAS Support.
+
+			// Find prim idx widths
+			const uint32_t baseIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri];
+			uint32_t primBaseIdx = baseIdx ? 31 - __builtin_clz(baseIdx) : 0; // TODO : Can be improved by choosing best PrimIdx
+			uint32_t primIdx = 0;
+
+			for (int i = 1; i < tcount ; i++) {
+				const uint32_t primIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri + i];
+				uint32_t testIdxWidth = 31 - __builtin_clz(baseIdx ^ primIdx);
+				if (testIdxWidth > primIdx) primIdx = testIdxWidth;
+			}
 
 			const uint32_t midpointOffset = 52 + (xBitWidth + yBitWidth + zBitWidth + 3) * tcount * 3
 									+ (geomBaseIdx << 1) + (geomIdx << 1) * (tcount - 1) + 3 * (31 - trailingZeroes) - (xBitWidth + yBitWidth + zBitWidth);
@@ -6480,26 +6566,14 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			writer.Write( primIdx, 5 );
 			writer.Write( midpointOffset, 10 );
 
-			for (uint32_t j = 0; j < tcount; j++)
+			for (uint32_t i = 0; i < tcount*3; i++) // Write verts
 			{
-				const uint32_t triIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri + j];
-				uint32_t ti0, ti1, ti2;
-				if (bvh8.bvh.vertIdx)
-					ti0 = bvh8.bvh.vertIdx[triIdx * 3],
-					ti1 = bvh8.bvh.vertIdx[triIdx * 3 + 1],
-					ti2 = bvh8.bvh.vertIdx[triIdx * 3 + 2];
-				else
-					ti0 = triIdx * 3, ti1 = triIdx * 3 + 1, ti2 = triIdx * 3 + 2;
+				bvhvec3 testVert = vertSoup[i];
+				
+				writer.Write( tinybvh_as_uint( (testVert.x >> trailingZeroes) | (~0 << xBitWidth ) ), xBitWidth );
+				writer.Write( tinybvh_as_uint( (testVert.y >> trailingZeroes) | (~0 << yBitWidth ) ), yBitWidth );
+				writer.Write( tinybvh_as_uint( (testVert.z >> trailingZeroes) | (~0 << zBitWidth ) ), zBitWidth );
 
-				writer.Write( tinybvh_as_uint( bvh8.bvh.verts[ti0].x ), xBitWidth + 1 );
-				writer.Write( tinybvh_as_uint( bvh8.bvh.verts[ti0].y ), yBitWidth + 1 );
-				writer.Write( tinybvh_as_uint( bvh8.bvh.verts[ti0].z ), zBitWidth + 1 );
-				writer.Write( tinybvh_as_uint( bvh8.bvh.verts[ti1].x ), xBitWidth + 1 );
-				writer.Write( tinybvh_as_uint( bvh8.bvh.verts[ti1].y ), yBitWidth + 1 );
-				writer.Write( tinybvh_as_uint( bvh8.bvh.verts[ti1].z ), zBitWidth + 1 );
-				writer.Write( tinybvh_as_uint( bvh8.bvh.verts[ti2].x ), xBitWidth + 1 );
-				writer.Write( tinybvh_as_uint( bvh8.bvh.verts[ti2].y ), yBitWidth + 1 );
-				writer.Write( tinybvh_as_uint( bvh8.bvh.verts[ti2].z ), zBitWidth + 1 );
 			}
 			// Geometry ID fields have zero width; primitive IDs follow the vertices.
 			writer.SkipTo( midpointOffset );
@@ -6509,19 +6583,39 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 				const uint32_t triIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri + j];
 				writer.Write( triIdx, primIdx );
 			}
-			// Final 29 bits describe the two triangles and their vertex indices.
-			writer.SkipTo( 1024 - 29 );
-			writer.Write( 1, 1 );
+
+			writer.SkipTo( 1024 - 29*pairCount );
+			for (int i = 0; i < pairCount - 1; pairCount++) {
+				writer.Write( 0, 1 );
+				writer.Write( 0, 1 );
+				writer.Write( 0, 1 );
+				writer.Write( idxAssign [(i * 2 + 1) * 3], 4);
+				writer.Write( idxAssign [(i * 2 + 1) * 3 + 1], 4);
+				writer.Write( idxAssign [(i * 2 + 1) * 3 + 2], 4);
+				writer.Write( 0, 1 );
+				writer.Write( 0, 1 );
+				writer.Write( idxAssign [(i * 2 ) * 3], 4);
+				writer.Write( idxAssign [(i * 2) * 3 + 1], 4);
+				writer.Write( idxAssign [(i * 2) * 3 + 2], 4);
+			}
+			// Write final pair:
 			writer.Write( 0, 1 );
 			writer.Write( 0, 1 );
-			writer.Write( tcount == 2 ? 3u : 0u, 4 );
-			writer.Write( tcount == 2 ? 4u : 0u, 4 );
-			writer.Write( tcount == 2 ? 5u : 0u, 4 );
+			writer.Write( 0, 1 );
+			if (tcount % 2 == 0) {
+				writer.Write( idxAssign [((pairCount-1) * 2 + 1) * 3], 4);
+				writer.Write( idxAssign [((pairCount-1) * 2 + 1) * 3 + 1], 4);
+				writer.Write( idxAssign [((pairCount-1) * 2 + 1) * 3 + 2], 4);
+			} else {
+				writer.Write( 0, 4);
+				writer.Write( 0, 4);
+				writer.Write( 0, 4);
+			}
 			writer.Write( 0, 1 );
 			writer.Write( 0, 1 );
-			writer.Write( 0, 4 );
-			writer.Write( 1, 4 );
-			writer.Write( 2, 4 );
+			writer.Write( idxAssign [((pairCount-1) * 2 ) * 3], 4);
+			writer.Write( idxAssign [((pairCount-1) * 2) * 3 + 1], 4);
+			writer.Write( idxAssign [((pairCount-1) * 2) * 3 + 2], 4);
 		}
 
 		bvh8Data[currentNodeAddr + 0].x = tinybvh_as_float( childBaseIndex );
