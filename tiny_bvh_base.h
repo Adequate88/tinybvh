@@ -6245,8 +6245,8 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::Build( const Slice& vertices, const 
 	bvh8.c_int = bvh8.bvh.c_int = c_int, bvh8.c_trav = bvh8.bvh.c_trav = c_trav;
 	// build underlying layout
 	bvh8.bvh.Build( vertices, indices, prims );
-	bvh8.bvh.SplitLeafs( 2 );
-	bvh8.leafPrimLimit = 2;
+	// bvh8.bvh.SplitLeafs( 2 );
+	// bvh8.leafPrimLimit = 2; // No longer needed since multi triangle packing
 	bvh8.ConvertFrom( bvh8.bvh );
 	// convert to AMD format
 	ConvertFrom( bvh8 );
@@ -6459,8 +6459,8 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			
 			// TODO :: Not well optimized
 			// Vertex soup and deduplication
-			bvhvec3 vertSoup[tcount*3];
-			uint32_t idxAssign[tcount*3];
+			bvhuint3 vertSoup[16*3]; // Set to max
+			uint32_t idxAssign[16*3];
 			for (int i = 0; i < tcount; i++) {
 				const uint32_t triIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri + i];
 				uint32_t ti0, ti1, ti2;
@@ -6472,55 +6472,60 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 					ti0 = triIdx * 3, ti1 = triIdx * 3 + 1, ti2 = triIdx * 3 + 2;
 
 				int v = i*3;
-				vertSoup[v].x = bvh8.bvh.verts[ti0].x;
-				vertSoup[v].y = bvh8.bvh.verts[ti0].y;
-				vertSoup[v].z = bvh8.bvh.verts[ti0].z;
+				bvhvec3 currentVert = bvh8.bvh.verts[ti0];
+				vertSoup[v] = bvhuint3( tinybvh_as_uint( currentVert.x ), tinybvh_as_uint( currentVert.y ), tinybvh_as_uint( currentVert.z ) );
+				currentVert = bvh8.bvh.verts[ti1];
+				vertSoup[v + 1] = bvhuint3( tinybvh_as_uint( currentVert.x ), tinybvh_as_uint( currentVert.y ), tinybvh_as_uint( currentVert.z ) );
+				currentVert = bvh8.bvh.verts[ti2];
+				vertSoup[v + 2] = bvhuint3( tinybvh_as_uint( currentVert.x ), tinybvh_as_uint( currentVert.y ), tinybvh_as_uint( currentVert.z ) );
+			}
 
-				vertSoup[v + 1].x = bvh8.bvh.verts[ti1].x;
-				vertSoup[v + 1].y = bvh8.bvh.verts[ti1].y;
-				vertSoup[v + 1].z = bvh8.bvh.verts[ti1].z;
+			// Dedup 
+			bvhuint3 uniqueVerts[16];
+			uint32_t uniqueVertCount = 0;
+			bool found = false;
+			for (int i = 0; i < tcount*3; i++) {
+				found = false;
+				bvhuint3 currentVert = vertSoup[i];
+				for (int j = 0; j < uniqueVertCount; j++) {
+					if (currentVert.x == uniqueVerts[j].x && currentVert.y == uniqueVerts[j].y && currentVert.z == uniqueVerts[j].z) {
+						idxAssign[i] = j;
+						found = true;
+						break;
+					} 
+				}
+				if (!found) {
+					idxAssign[i] = uniqueVertCount;
+					uniqueVerts[uniqueVertCount++] = currentVert;
 
-				vertSoup[v + 2].x = bvh8.bvh.verts[ti2].x;
-				vertSoup[v + 2].y = bvh8.bvh.verts[ti2].y;
-				vertSoup[v + 2].z = bvh8.bvh.verts[ti2].z;
-
-				for (int offset = 0; offset < 3; offset++) {
-					for (int j = 0; j < v; j++) { // Vertex already exists?
-						if ( vertSoup[v + offset].x == vertSoup[j].x && vertSoup[v + offset].y == vertSoup[j].y && vertSoup[v + offset].z == vertSoup[j].z) {
-							idxAssign[v + offset] = j;
-						} else {
-							idxAssign[v + offset] = v + offset;
-						}
-					}
 				}
 			}
+			BVH_FATAL_ERROR_IF( uniqueVertCount > 15,
+          		"CWBVH8_AMD_HW::ConvertFrom( .. ), leaf has too many unique vertices." );
 
 			// Compute Header Bit Widths and trailing zeroes
-			uint32_t xPrefixBits = 31; // Encoded as vertex bit width minus one.
-			uint32_t yPrefixBits = 31;
-			uint32_t zPrefixBits = 31;
-			uint32_t trailingZeroes = 31;
+			uint32_t xPrefixBits = 0;
+			uint32_t yPrefixBits = 0;
+			uint32_t zPrefixBits = 0;
 			
-			const bvhvec3 refVert = vertSoup[0];
-			for (int i = 1; i < tcount*3; i++) {
-				const bvhvec3 testVert = vertSoup[i];
+			const bvhuint3 refVert = uniqueVerts[0];
+			uint32_t trailingZeroBits = refVert.x | refVert.y | refVert.z;
 
-				uint32_t xTestPrefixBits = __builtin_clz( refVert.x ^ testVert.x ) - 1;
-				uint32_t yTestPrefixBits = __builtin_clz( refVert.y ^ testVert.y ) - 1;
-				uint32_t zTestPrefixBits = __builtin_clz( refVert.z ^ testVert.z ) - 1;
+			for (int i = 1; i < uniqueVertCount; i++) {
+				const bvhuint3 testVert = uniqueVerts[i];
 
-				if (xTestPrefixBits < xPrefixBits) xPrefixBits = xTestPrefixBits;
-				if (yTestPrefixBits < yPrefixBits) yPrefixBits = yTestPrefixBits;
-				if (zTestPrefixBits < zPrefixBits) zPrefixBits = zTestPrefixBits;
+				xPrefixBits |= refVert.x ^ testVert.x;
+				yPrefixBits |= refVert.y ^ testVert.y;
+				zPrefixBits |= refVert.z ^ testVert.z;
 
 				// Trailing zeroes ( shared across all axis)
-				int testTZ = _builtin_ctz(testVert.x) - 1;
-				if (testTZ < trailingZeroes) trailingZeroes = testTZ;
-				testTZ = _builtin_ctz(testVert.y) - 1;
-				if (testTZ < trailingZeroes) trailingZeroes = testTZ;
-				testTZ = _builtin_ctz(testVert.z) - 1;
-				if (testTZ < trailingZeroes) trailingZeroes = testTZ;
+				trailingZeroBits |= testVert.x | testVert.y | testVert.z;
 			}
+
+			xPrefixBits = xPrefixBits != 0 ? __builtin_clz(xPrefixBits) : 0;
+			yPrefixBits = yPrefixBits != 0 ? __builtin_clz(yPrefixBits) : 0;
+			zPrefixBits = zPrefixBits != 0 ? __builtin_clz(zPrefixBits) : 0;
+			uint32_t trailingZeroes = trailingZeroBits != 0 ? __builtin_ctz(trailingZeroBits) : 31;
 
 			// Payload Widths
 			const uint32_t xBitWidth = 31 - trailingZeroes - xPrefixBits;
@@ -6530,7 +6535,7 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			// Check if it will fit so far:
 			uint32_t pairCount = ( tcount + 1 ) / 2;
 
-			uint32_t dataBits = 1024 - 52 - xPrefixBits - yPrefixBits - zPrefixBits - 29 * pairCount - tcount*3 * (xBitWidth + yBitWidth + zBitWidth); // TODO : This is a conservative and worst case value
+			int dataBits = 1024 - 52 - xPrefixBits - yPrefixBits - zPrefixBits - 29 * pairCount - tcount*3 * (xBitWidth + yBitWidth + zBitWidth); // TODO : This is a conservative and worst case value
 			BVH_FATAL_ERROR_IF( dataBits < 0,
 				"Could not pack triangles in CWBVH8_AMD"); // TODO : Rather than failing this should resort to a fail-safe packing
 
@@ -6544,8 +6549,8 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			uint32_t primIdx = 0;
 
 			for (int i = 1; i < tcount ; i++) {
-				const uint32_t primIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri + i];
-				uint32_t testIdxWidth = 31 - __builtin_clz(baseIdx ^ primIdx);
+				const uint32_t testIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri + i];
+				uint32_t testIdxWidth = 31 - __builtin_clz(baseIdx ^ testIdx);
 				if (testIdxWidth > primIdx) primIdx = testIdxWidth;
 			}
 
@@ -6566,13 +6571,13 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			writer.Write( primIdx, 5 );
 			writer.Write( midpointOffset, 10 );
 
-			for (uint32_t i = 0; i < tcount*3; i++) // Write verts
+			for (uint32_t i = 0; i < uniqueVertCount; i++) // Write verts
 			{
-				bvhvec3 testVert = vertSoup[i];
+				bvhuint3 testVert = uniqueVerts[i];
 				
-				writer.Write( tinybvh_as_uint( (testVert.x >> trailingZeroes) | (~0 << xBitWidth ) ), xBitWidth );
-				writer.Write( tinybvh_as_uint( (testVert.y >> trailingZeroes) | (~0 << yBitWidth ) ), yBitWidth );
-				writer.Write( tinybvh_as_uint( (testVert.z >> trailingZeroes) | (~0 << zBitWidth ) ), zBitWidth );
+				writer.Write( (testVert.x >> trailingZeroes) , xBitWidth + 1 );
+				writer.Write( (testVert.y >> trailingZeroes) , yBitWidth + 1 );
+				writer.Write( (testVert.z >> trailingZeroes) , zBitWidth + 1 );
 
 			}
 			// Geometry ID fields have zero width; primitive IDs follow the vertices.
@@ -6585,7 +6590,7 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			}
 
 			writer.SkipTo( 1024 - 29*pairCount );
-			for (int i = 0; i < pairCount - 1; pairCount++) {
+			for (int i = 0; i < pairCount - 1; i++) {
 				writer.Write( 0, 1 );
 				writer.Write( 0, 1 );
 				writer.Write( 0, 1 );
