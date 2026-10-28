@@ -6365,12 +6365,15 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 		const Vec3 nodeLo = orig->aabbMin, nodeHi = orig->aabbMax;
 
 		// Group children by type
-		uint32_t slotChild[8] = {};
-		int32_t internalChildCount = 0, leafChildCount = 0;
+		bool primOverflow = false;
+		int32_t overflowPrimCount = 0; uint32_t overflowedPrimitives[8] = {};
+		uint32_t internalChild[8] = {};
+		uint32_t primChild[8] = {};
+		int32_t internalChildCount = 0, primChildCount = 0;
 		if (orig->isLeaf())
 		{
-			slotChild[0] = origIdx;
-			leafChildCount = 1;
+			primChild[0] = origIdx;
+			primChildCount = 1;
 		}
 		else
 		{
@@ -6378,13 +6381,22 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			{
 				const auto idx = orig->child[i];
 				if (idx != 0 && !bvh8.mbvhNode[idx].isLeaf())
-					slotChild[internalChildCount++] = idx;
+					internalChild[internalChildCount++] = idx;
 			}
+			int32_t nodeCount = internalChildCount;
 			for (int32_t i = 0; i < 8; i++)
 			{
 				const auto idx = orig->child[i];
-				if (idx != 0 && bvh8.mbvhNode[idx].isLeaf())
-					slotChild[internalChildCount + leafChildCount++] = idx;
+				const typename MBVH<8, Float, Index>::MBVHNode* const child = &bvh8.mbvhNode[idx];
+				if (idx != 0 && child.isLeaf())
+					nodeCount += (child->triCount % 2) + 1;
+					// Packing triangles per slot could cause underflow, so need to create new internal node 
+					if (nodeCount > 8) {
+						primOverflow = true;
+						overflowedPrimitives[overflowPrimCount++] = idx;
+						continue;
+					}
+					primChild[primChildCount++] = idx;
 			}
 		}
 
@@ -6397,16 +6409,12 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 		const float extentZ = tinybvh_as_float( uint32_t( ez + 127 ) << 23 );
 		// encode output
 		uint32_t childBaseIndex = 0, leafBaseIndex = 0;
-		for (int32_t i = 0; i < 8; i++)
+		uint32_t* childInfo = (uint32_t*)&bvh8Data[currentNodeAddr] + 8;
+		uint32_t slotsUsed = 0;
+
+		for (int32_t i = 0; i < internalChildCount; i++)
 		{
-			uint32_t* const childInfo = (uint32_t*)&bvh8Data[currentNodeAddr] + 8 + i * 3;
-			if (i >= internalChildCount + leafChildCount)
-			{
-				// Invalid quantized bounds and a zero record size mark an empty child.
-				childInfo[0] = 0xffffffffu, childInfo[1] = 0xfffu, childInfo[2] = 0;
-				continue;
-			}
-			const typename MBVH<8, Float, Index>::MBVHNode* const child = &bvh8.mbvhNode[slotChild[i]];
+			const typename MBVH<8, Float, Index>::MBVHNode* const child = &bvh8.mbvhNode[internalChild[i]];
 
 			const uint32_t minX = tinybvh_min( uint32_t( floor( (double( child->aabbMin.x ) - double( nodeLo.x )) / double( extentX ) * 4096.0 ) ), 4095u );
 			const uint32_t minY = tinybvh_min( uint32_t( floor( (double( child->aabbMin.y ) - double( nodeLo.y )) / double( extentY ) * 4096.0 ) ), 4095u );
@@ -6415,46 +6423,49 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			const uint32_t maxY = tinybvh_min( uint32_t( ceil( (double( child->aabbMax.y ) - double( nodeLo.y )) / double( extentY ) * 4096.0 ) ) - 1u, 4095u );
 			const uint32_t maxZ = tinybvh_min( uint32_t( ceil( (double( child->aabbMax.z ) - double( nodeLo.z )) / double( extentZ ) * 4096.0 ) ) - 1u, 4095u );
 
-			if (!child->isLeaf())
-			{
-				childInfo[0] = minX | (minY << 12);
-				childInfo[1] = minZ | (maxX << 12) | (0xffu << 24);
-				childInfo[2] = maxY | (maxZ << 12) | (NODE_BOX32 << 24) | (1u << 28); // BOX32, one 128-byte record.
-
-				// interior node, set params and push onto stack
-				const uint32_t childNodeAddr = nodeDataPtr;
-				if (i == 0) childBaseIndex = childNodeAddr * 2;
-				nodeDataPtr += 8;
-				if (stackPtr == stackCap)
-				{
-					const uint32_t newCap = stackCap * 2;
-					uint32_t* ni = (uint32_t*)AlignedAlloc( newCap * 4 );
-					uint32_t* na = (uint32_t*)AlignedAlloc( newCap * 4 );
-					uint32_t* np = (uint32_t*)AlignedAlloc( newCap * 4 );
-					memcpy( ni, stackNodeIdx, stackCap * 4 ), memcpy( na, stackNodeAddr, stackCap * 4 );
-					memcpy( np, parentNodeID, stackCap * 4 );
-					AlignedFree( stackNodeIdx ), AlignedFree( stackNodeAddr );
-					AlignedFree( parentNodeID );
-					stackNodeIdx = ni, stackNodeAddr = na, parentNodeID = np, stackCap = newCap;
-				}
-				stackNodeIdx[stackPtr] = slotChild[i], stackNodeAddr[stackPtr] = childNodeAddr, parentNodeID[stackPtr++] = PackNodeID( currentNodeAddr * 16, NODE_BOX32 );
-				continue;
-			}
-			// leaf node
 			childInfo[0] = minX | (minY << 12);
-			childInfo[1] = minZ | (maxX << 12) | (0xffu << 24); // All ray mask bits enabled.
-			childInfo[2] = maxY | (maxZ << 12) | (NODE_TRIANGLE << 24) | (1u << 28); // Triangle pair, one 128-byte record.
+			childInfo[1] = minZ | (maxX << 12) | (0xffu << 24);
+			childInfo[2] = maxY | (maxZ << 12) | (NODE_BOX32 << 24) | (1u << 28); // BOX32, one 128-byte record.
+			childInfo += 3;
+			slotsUsed++;
+
+			// interior node, set params and push onto stack
+			const uint32_t childNodeAddr = nodeDataPtr;
+			if (i == 0) childBaseIndex = childNodeAddr * 2;
+			nodeDataPtr += 8;
+			if (stackPtr == stackCap)
+			{
+				const uint32_t newCap = stackCap * 2;
+				uint32_t* ni = (uint32_t*)AlignedAlloc( newCap * 4 );
+				uint32_t* na = (uint32_t*)AlignedAlloc( newCap * 4 );
+				uint32_t* np = (uint32_t*)AlignedAlloc( newCap * 4 );
+				memcpy( ni, stackNodeIdx, stackCap * 4 ), memcpy( na, stackNodeAddr, stackCap * 4 );
+				memcpy( np, parentNodeID, stackCap * 4 );
+				AlignedFree( stackNodeIdx ), AlignedFree( stackNodeAddr );
+				AlignedFree( parentNodeID );
+				stackNodeIdx = ni, stackNodeAddr = na, parentNodeID = np, stackCap = newCap;
+			}
+			stackNodeIdx[stackPtr] = internalChild[i], stackNodeAddr[stackPtr] = childNodeAddr, parentNodeID[stackPtr++] = PackNodeID( currentNodeAddr * 16, NODE_BOX32 );
+		}
+
+		if (primOverflow) {
+			// To something
+		}
+
+		// Prim and Leaf Nodes
+		for (int32_t i = 0; i < primChildCount; i++)
+		{
+			const typename MBVH<8, Float, Index>::MBVHNode* const child = &bvh8.mbvhNode[primChild[i]];
+
 
 			const uint32_t leafNodeAddr = nodeDataPtr;
-			if (i == internalChildCount) leafBaseIndex = leafNodeAddr * 2;
+			if (i == 0) leafBaseIndex = leafNodeAddr * 2;
 			nodeDataPtr += 8;
-
-			AMDBitWriter writer( &bvh8Data[leafNodeAddr] );
 
 			const uint32_t tcount = child->triCount;
 			BVH_FATAL_ERROR_IF( tcount == 0 || tcount > 15,
 				"CWBVH8_AMD_HW::ConvertFrom( .. ), leaf with unsupported triangle count; set triangle limit to 16 first." );
-			
+
 			// TODO :: Not well optimized
 			// Vertex soup and deduplication
 			bvhuint3 vertSoup[16*3]; // Set to max
@@ -6530,10 +6541,6 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			const uint32_t yBitWidth = 31 - trailingZeroes - yPrefixBits;
 			const uint32_t zBitWidth = 31 - trailingZeroes - zPrefixBits;
 
-			// Check if it will fit so far:
-			uint32_t pairCount = ( tcount + 1 ) / 2;
-
-
 			const uint32_t geomBaseIdx = 0;
 			const uint32_t geomIdx = 0; // TODO : Currently No TLAS Support.
 
@@ -6548,11 +6555,13 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 				if (testIdxWidth > primIdx) primIdx = testIdxWidth;
 			}
 
+			uint32_t pairCount = ( tcount + 1 ) / 2;
 			int dataBits = 1024 - 52 - xPrefixBits - yPrefixBits - zPrefixBits - 29 * pairCount - uniqueVertCount * (xBitWidth + yBitWidth + zBitWidth + 3) - primBaseIdx - primIdx* (tcount -1); 
 			BVH_FATAL_ERROR_IF( dataBits < 0,
 				"Could not pack triangles in CWBVH8_AMD"); // TODO : Rather than failing this should resort to a fail-safe packing
 
 			const uint32_t midpointOffset = 52 + (xPrefixBits + yPrefixBits + zPrefixBits) + uniqueVertCount * (xBitWidth + yBitWidth + zBitWidth + 3) + (geomBaseIdx << 1) + (geomIdx << 1) * (uniqueVertCount - 1);
+			AMDBitWriter writer( &bvh8Data[leafNodeAddr] );
 
 			// x bits | y bits | z bits | trailing bits | geom base | geom | pair count | vertex type
 			writer.Write( xBitWidth, 5 );
@@ -6606,6 +6615,32 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 					writer.Write( idxAssign [(i * 2) * 3 + j], 4);
 				}
 			}
+			
+			// TODO : Currently all triangle pairs will share the same AABB
+			const uint32_t minX = tinybvh_min( uint32_t( floor( (double( child->aabbMin.x ) - double( nodeLo.x )) / double( extentX ) * 4096.0 ) ), 4095u );
+			const uint32_t minY = tinybvh_min( uint32_t( floor( (double( child->aabbMin.y ) - double( nodeLo.y )) / double( extentY ) * 4096.0 ) ), 4095u );
+			const uint32_t minZ = tinybvh_min( uint32_t( floor( (double( child->aabbMin.z ) - double( nodeLo.z )) / double( extentZ ) * 4096.0 ) ), 4095u );
+			const uint32_t maxX = tinybvh_min( uint32_t( ceil( (double( child->aabbMax.x ) - double( nodeLo.x )) / double( extentX ) * 4096.0 ) ) - 1u, 4095u );
+			const uint32_t maxY = tinybvh_min( uint32_t( ceil( (double( child->aabbMax.y ) - double( nodeLo.y )) / double( extentY ) * 4096.0 ) ) - 1u, 4095u );
+			const uint32_t maxZ = tinybvh_min( uint32_t( ceil( (double( child->aabbMax.z ) - double( nodeLo.z )) / double( extentZ ) * 4096.0 ) ) - 1u, 4095u );
+			
+			for (int pair = 0; pair < pairCount; pair++ ){
+				uint32_t size = pair == pairCount - 1 ? 1u : 0u;				
+				childInfo[0] = minX | (minY << 12);
+				childInfo[1] = minZ | (maxX << 12) | (0xffu << 24); // All ray mask bits enabled.
+				childInfo[2] = maxY | (maxZ << 12) | (NODE_TRIANGLE << 24) | (size << 28); // Triangle pair, one 128-byte record.
+				childInfo += 3;
+				slotsUsed++;
+			}
+		}
+
+		// Empty slots with null values
+		for (int i = 0; i < (8 - slotsUsed); i++)
+		{
+			// Invalid quantized bounds and a zero record size mark an empty child.
+			childInfo[0] = 0xffffffffu, childInfo[1] = 0xfffu, childInfo[2] = 0;
+			childInfo += 3;
+			continue;
 		}
 
 		bvh8Data[currentNodeAddr + 0].x = tinybvh_as_float( childBaseIndex );
