@@ -6245,8 +6245,8 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::Build( const Slice& vertices, const 
 	bvh8.c_int = bvh8.bvh.c_int = c_int, bvh8.c_trav = bvh8.bvh.c_trav = c_trav;
 	// build underlying layout
 	bvh8.bvh.Build( vertices, indices, prims );
-	bvh8.bvh.SplitLeafs( 2 );
-	bvh8.leafPrimLimit = 2; // No longer needed since multi triangle packing
+	bvh8.bvh.SplitLeafs( 16 ); // A primitive record holds at most 8 triangle pairs.
+	//bvh8.leafPrimLimit = 2; // No longer needed since multi triangle packing
 	bvh8.ConvertFrom( bvh8.bvh );
 	// convert to AMD format
 	ConvertFrom( bvh8 );
@@ -6388,15 +6388,17 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			{
 				const auto idx = orig->child[i];
 				const typename MBVH<8, Float, Index>::MBVHNode* const child = &bvh8.mbvhNode[idx];
-				if (idx != 0 && child.isLeaf())
-					nodeCount += (child->triCount % 2) + 1;
-					// Packing triangles per slot could cause underflow, so need to create new internal node 
+				if (idx != 0 && child->isLeaf())
+				{
+					nodeCount += (child->triCount + 1) >> 1;
+					// Packing triangles per slot could cause underflow, so need to create new internal node
 					if (nodeCount > 8) {
 						primOverflow = true;
 						overflowedPrimitives[overflowPrimCount++] = idx;
 						continue;
 					}
 					primChild[primChildCount++] = idx;
+				}
 			}
 		}
 
@@ -6458,164 +6460,190 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			const typename MBVH<8, Float, Index>::MBVHNode* const child = &bvh8.mbvhNode[primChild[i]];
 
 
-			const uint32_t leafNodeAddr = nodeDataPtr;
-			if (i == 0) leafBaseIndex = leafNodeAddr * 2;
-			nodeDataPtr += 8;
+			if (i == 0) leafBaseIndex = nodeDataPtr * 2;
 
 			const uint32_t tcount = child->triCount;
-			BVH_FATAL_ERROR_IF( tcount == 0 || tcount > 15,
+			// At most 8 pairs: a node has 8 child slots, and a record's pair count is a 3-bit field.
+			BVH_FATAL_ERROR_IF( tcount == 0 || tcount > 16,
 				"CWBVH8_AMD_HW::ConvertFrom( .. ), leaf with unsupported triangle count; set triangle limit to 16 first." );
 
-			// TODO :: Not well optimized
-			// Vertex soup and deduplication
-			bvhuint3 vertSoup[16*3]; // Set to max
-			uint32_t idxAssign[16*3];
-			for (uint32_t i = 0; i < tcount; i++) {
-				const uint32_t triIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri + i];
-				uint32_t ti0, ti1, ti2;
-				if (bvh8.bvh.vertIdx)
-					ti0 = bvh8.bvh.vertIdx[triIdx * 3],
-					ti1 = bvh8.bvh.vertIdx[triIdx * 3 + 1],
-					ti2 = bvh8.bvh.vertIdx[triIdx * 3 + 2];
-				else
-					ti0 = triIdx * 3, ti1 = triIdx * 3 + 1, ti2 = triIdx * 3 + 2;
-
-				int v = i*3;
-				bvhvec3 currentVert = bvh8.bvh.verts[ti0];
-				vertSoup[v] = bvhuint3( tinybvh_as_uint( currentVert.x ), tinybvh_as_uint( currentVert.y ), tinybvh_as_uint( currentVert.z ) );
-				currentVert = bvh8.bvh.verts[ti1];
-				vertSoup[v + 1] = bvhuint3( tinybvh_as_uint( currentVert.x ), tinybvh_as_uint( currentVert.y ), tinybvh_as_uint( currentVert.z ) );
-				currentVert = bvh8.bvh.verts[ti2];
-				vertSoup[v + 2] = bvhuint3( tinybvh_as_uint( currentVert.x ), tinybvh_as_uint( currentVert.y ), tinybvh_as_uint( currentVert.z ) );
-			}
-
-			// Dedup 
-			bvhuint3 uniqueVerts[45];
-			uint32_t uniqueVertCount = 0;
-			bool found = false;
-			for (uint32_t i = 0; i < tcount*3; i++) {
-				found = false;
-				bvhuint3 currentVert = vertSoup[i];
-				for (uint32_t j = 0; j < uniqueVertCount; j++) {
-					if (currentVert.x == uniqueVerts[j].x && currentVert.y == uniqueVerts[j].y && currentVert.z == uniqueVerts[j].z) {
-						idxAssign[i] = j;
-						found = true;
-						break;
-					} 
-				}
-				if (!found) {
-					idxAssign[i] = uniqueVertCount;
-					uniqueVerts[uniqueVertCount++] = currentVert;
-
-				}
-			}
-			BVH_FATAL_ERROR_IF( uniqueVertCount > 15,
-          		"CWBVH8_AMD_HW::ConvertFrom( .. ), leaf has too many unique vertices." );
-
-			// Compute Header Bit Widths and trailing zeroes
-			uint32_t xPrefixBits = 0;
-			uint32_t yPrefixBits = 0;
-			uint32_t zPrefixBits = 0;
-			
-			const bvhuint3 refVert = uniqueVerts[0];
-			uint32_t trailingZeroBits = refVert.x | refVert.y | refVert.z;
-
-			for (uint32_t i = 1; i < uniqueVertCount; i++) {
-				const bvhuint3 testVert = uniqueVerts[i];
-
-				xPrefixBits |= refVert.x ^ testVert.x;
-				yPrefixBits |= refVert.y ^ testVert.y;
-				zPrefixBits |= refVert.z ^ testVert.z;
-
-				// Trailing zeroes ( shared across all axis)
-				trailingZeroBits |= testVert.x | testVert.y | testVert.z;
-			}
-
-			xPrefixBits = xPrefixBits != 0 ? __builtin_clz(xPrefixBits) : 0;
-			yPrefixBits = yPrefixBits != 0 ? __builtin_clz(yPrefixBits) : 0;
-			zPrefixBits = zPrefixBits != 0 ? __builtin_clz(zPrefixBits) : 0;
-			uint32_t trailingZeroes = trailingZeroBits != 0 ? __builtin_ctz(trailingZeroBits) : 31;
-
-			// Payload Widths
-			const uint32_t xBitWidth = 31 - trailingZeroes - xPrefixBits;
-			const uint32_t yBitWidth = 31 - trailingZeroes - yPrefixBits;
-			const uint32_t zBitWidth = 31 - trailingZeroes - zPrefixBits;
-
-			const uint32_t geomBaseIdx = 0;
-			const uint32_t geomIdx = 0; // TODO : Currently No TLAS Support.
-
-			// Find prim idx widths
-			const uint32_t baseIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri];
-			uint32_t primBaseIdx = baseIdx ? 32 - __builtin_clz(baseIdx) : 0; // TODO : Can be improved by choosing best PrimIdx
-			uint32_t primIdx = 0;
-
-			for (uint32_t i = 1; i < tcount ; i++) {
-				const uint32_t testIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri + i];
-				uint32_t testIdxWidth = 32 - __builtin_clz(baseIdx ^ testIdx);
-				if (testIdxWidth > primIdx) primIdx = testIdxWidth;
-			}
-
-			uint32_t pairCount = ( tcount + 1 ) / 2;
-			int dataBits = 1024 - 52 - xPrefixBits - yPrefixBits - zPrefixBits - 29 * pairCount - uniqueVertCount * (xBitWidth + yBitWidth + zBitWidth + 3) - primBaseIdx - primIdx* (tcount -1); 
-			BVH_FATAL_ERROR_IF( dataBits < 0,
-				"Could not pack triangles in CWBVH8_AMD"); // TODO : Rather than failing this should resort to a fail-safe packing
-
-			const uint32_t midpointOffset = 52 + (xPrefixBits + yPrefixBits + zPrefixBits) + uniqueVertCount * (xBitWidth + yBitWidth + zBitWidth + 3) + (geomBaseIdx << 1) + (geomIdx << 1) * (uniqueVertCount - 1);
-			AMDBitWriter writer( &bvh8Data[leafNodeAddr] );
-
-			// x bits | y bits | z bits | trailing bits | geom base | geom | pair count | vertex type
-			writer.Write( xBitWidth, 5 );
-			writer.Write( yBitWidth, 5 );
-			writer.Write( zBitWidth, 5 );
-			writer.Write( trailingZeroes, 5 );
-			writer.Write( geomBaseIdx, 4 );
-			writer.Write( geomIdx, 4 );
-			writer.Write( pairCount - 1, 3 );
-			writer.Write( 0, 1 );
-			// Primitive ID widths and bit offset of the first primitive ID.
-			writer.Write( primBaseIdx, 5 );
-			writer.Write( primIdx, 5 );
-			writer.Write( midpointOffset, 10 );
-
-			// Write prefixes
-			if (xPrefixBits) writer.Write( refVert.x >> (xBitWidth + 1 + trailingZeroes), xPrefixBits );
-			if (yPrefixBits) writer.Write( refVert.y >> (yBitWidth + 1 + trailingZeroes), yPrefixBits );
-			if (zPrefixBits) writer.Write( refVert.z >> (zBitWidth + 1 + trailingZeroes), zPrefixBits );
-
-			for (uint32_t i = 0; i < uniqueVertCount; i++) // Write verts
+			// Encode the whole leaf as one record. If it does not fit, start over with one record per pair:
+			// every pair has its own child slot either way, so this costs memory, not slots. One pair always fits.
+			uint32_t pairsInRecord[8], recordCount = 0;
+			bool onePairPerRecord = false;
+			for (uint32_t recFirst = 0; recFirst < tcount;)
 			{
-				bvhuint3 testVert = uniqueVerts[i];
-				
-				writer.Write( (testVert.x >> trailingZeroes) , xBitWidth + 1 );
-				writer.Write( (testVert.y >> trailingZeroes) , yBitWidth + 1 );
-				writer.Write( (testVert.z >> trailingZeroes) , zBitWidth + 1 );
+				const uint32_t recTris = onePairPerRecord ? tinybvh_min( 2u, tcount - recFirst ) : tcount;
+				const uint32_t firstTri = child->firstTri + recFirst;
+				const uint32_t leafNodeAddr = nodeDataPtr;
 
-			}
-			// Geometry ID fields have zero width; primitive IDs follow the vertices.
-			writer.SkipTo( midpointOffset );
-			writer.Write( (uint32_t)bvh8.bvh.primIdx[child->firstTri], primBaseIdx ); // Original ID of the first triangle.
-			for (uint32_t j = 1; j < tcount; j++)
-			{
-				const uint32_t triIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri + j];
-				writer.Write( triIdx, primIdx );
+				// TODO :: Not well optimized
+				// Vertex soup and deduplication
+				bvhuint3 vertSoup[16*3]; // Set to max
+				uint32_t idxAssign[16*3];
+				for (uint32_t i = 0; i < recTris; i++) {
+					const uint32_t triIdx = (uint32_t)bvh8.bvh.primIdx[firstTri + i];
+					uint32_t ti0, ti1, ti2;
+					if (bvh8.bvh.vertIdx)
+						ti0 = bvh8.bvh.vertIdx[triIdx * 3],
+						ti1 = bvh8.bvh.vertIdx[triIdx * 3 + 1],
+						ti2 = bvh8.bvh.vertIdx[triIdx * 3 + 2];
+					else
+						ti0 = triIdx * 3, ti1 = triIdx * 3 + 1, ti2 = triIdx * 3 + 2;
+
+					int v = i*3;
+					bvhvec3 currentVert = bvh8.bvh.verts[ti0];
+					vertSoup[v] = bvhuint3( tinybvh_as_uint( currentVert.x ), tinybvh_as_uint( currentVert.y ), tinybvh_as_uint( currentVert.z ) );
+					currentVert = bvh8.bvh.verts[ti1];
+					vertSoup[v + 1] = bvhuint3( tinybvh_as_uint( currentVert.x ), tinybvh_as_uint( currentVert.y ), tinybvh_as_uint( currentVert.z ) );
+					currentVert = bvh8.bvh.verts[ti2];
+					vertSoup[v + 2] = bvhuint3( tinybvh_as_uint( currentVert.x ), tinybvh_as_uint( currentVert.y ), tinybvh_as_uint( currentVert.z ) );
+				}
+
+				// Dedup
+				bvhuint3 uniqueVerts[16*3];
+				uint32_t uniqueVertCount = 0;
+				bool found = false;
+				for (uint32_t i = 0; i < recTris*3; i++) {
+					found = false;
+					bvhuint3 currentVert = vertSoup[i];
+					for (uint32_t j = 0; j < uniqueVertCount; j++) {
+						if (currentVert.x == uniqueVerts[j].x && currentVert.y == uniqueVerts[j].y && currentVert.z == uniqueVerts[j].z) {
+							idxAssign[i] = j;
+							found = true;
+							break;
+						}
+					}
+					if (!found) {
+						idxAssign[i] = uniqueVertCount;
+						uniqueVerts[uniqueVertCount++] = currentVert;
+
+					}
+				}
+				// 4-bit vertex indices with 0xF reserved for procedural nodes: at most 15 unique vertices.
+				if (uniqueVertCount > 15)
+				{
+					BVH_FATAL_ERROR_IF( onePairPerRecord, "CWBVH8_AMD_HW::ConvertFrom( .. ), triangle pair does not fit in a primitive record." );
+					onePairPerRecord = true;
+					continue;
+				}
+
+				// Compute Header Bit Widths and trailing zeroes
+				uint32_t xPrefixBits = 0;
+				uint32_t yPrefixBits = 0;
+				uint32_t zPrefixBits = 0;
+
+				const bvhuint3 refVert = uniqueVerts[0];
+				uint32_t trailingZeroBits = refVert.x | refVert.y | refVert.z;
+
+				for (uint32_t i = 1; i < uniqueVertCount; i++) {
+					const bvhuint3 testVert = uniqueVerts[i];
+
+					xPrefixBits |= refVert.x ^ testVert.x;
+					yPrefixBits |= refVert.y ^ testVert.y;
+					zPrefixBits |= refVert.z ^ testVert.z;
+
+					// Trailing zeroes ( shared across all axis)
+					trailingZeroBits |= testVert.x | testVert.y | testVert.z;
+				}
+
+				uint32_t trailingZeroes = trailingZeroBits != 0 ? __builtin_ctz(trailingZeroBits) : 31;
+				// Axis where all verts are equal: everything goes in the prefix, leaving a 1-bit payload.
+				xPrefixBits = xPrefixBits != 0 ? __builtin_clz(xPrefixBits) : 31 - trailingZeroes;
+				yPrefixBits = yPrefixBits != 0 ? __builtin_clz(yPrefixBits) : 31 - trailingZeroes;
+				zPrefixBits = zPrefixBits != 0 ? __builtin_clz(zPrefixBits) : 31 - trailingZeroes;
+
+				// Payload Widths
+				const uint32_t xBitWidth = 31 - trailingZeroes - xPrefixBits;
+				const uint32_t yBitWidth = 31 - trailingZeroes - yPrefixBits;
+				const uint32_t zBitWidth = 31 - trailingZeroes - zPrefixBits;
+
+				const uint32_t geomBaseIdx = 0;
+				const uint32_t geomIdx = 0; // TODO : Currently No TLAS Support.
+
+				// Find prim idx widths
+				const uint32_t baseIdx = (uint32_t)bvh8.bvh.primIdx[firstTri];
+				uint32_t primBaseIdx = baseIdx ? 32 - __builtin_clz(baseIdx) : 0; // TODO : Can be improved by choosing best PrimIdx
+				uint32_t primIdx = 0;
+
+				for (uint32_t i = 1; i < recTris ; i++) {
+					const uint32_t testIdx = (uint32_t)bvh8.bvh.primIdx[firstTri + i];
+					uint32_t testIdxWidth =  baseIdx != testIdx ? 32 - __builtin_clz(baseIdx ^ testIdx) : 0;
+					if (testIdxWidth > primIdx) primIdx = testIdxWidth;
+				}
+
+				uint32_t pairCount = ( recTris + 1 ) / 2;
+				int dataBits = 1024 - 52 - xPrefixBits - yPrefixBits - zPrefixBits - 29 * pairCount - uniqueVertCount * (xBitWidth + yBitWidth + zBitWidth + 3) - primBaseIdx - primIdx * (2 * pairCount - 1);
+				if (dataBits < 0)
+				{
+					BVH_FATAL_ERROR_IF( onePairPerRecord, "CWBVH8_AMD_HW::ConvertFrom( .. ), triangle pair does not fit in a primitive record." );
+					onePairPerRecord = true;
+					continue;
+				}
+
+				const uint32_t midpointOffset = 52 + (xPrefixBits + yPrefixBits + zPrefixBits) + uniqueVertCount * (xBitWidth + yBitWidth + zBitWidth + 3) + (geomBaseIdx << 1) + (geomIdx << 1) * (2*pairCount - 1);
+				AMDBitWriter writer( &bvh8Data[leafNodeAddr] );
+
+				// x bits | y bits | z bits | trailing bits | geom base | geom | pair count | vertex type
+				writer.Write( xBitWidth, 5 );
+				writer.Write( yBitWidth, 5 );
+				writer.Write( zBitWidth, 5 );
+				writer.Write( trailingZeroes, 5 );
+				writer.Write( geomBaseIdx, 4 );
+				writer.Write( geomIdx, 4 );
+				writer.Write( pairCount - 1, 3 );
+				writer.Write( 0, 1 );
+				// Primitive ID widths and bit offset of the first primitive ID.
+				writer.Write( primBaseIdx, 5 );
+				writer.Write( primIdx, 5 );
+				writer.Write( midpointOffset, 10 );
+
+				// Write prefixes
+				if (xPrefixBits) writer.Write( refVert.x >> (xBitWidth + 1 + trailingZeroes), xPrefixBits );
+				if (yPrefixBits) writer.Write( refVert.y >> (yBitWidth + 1 + trailingZeroes), yPrefixBits );
+				if (zPrefixBits) writer.Write( refVert.z >> (zBitWidth + 1 + trailingZeroes), zPrefixBits );
+
+				for (uint32_t i = 0; i < uniqueVertCount; i++) // Write verts
+				{
+					bvhuint3 testVert = uniqueVerts[i];
+
+					writer.Write( (testVert.x >> trailingZeroes) , xBitWidth + 1 );
+					writer.Write( (testVert.y >> trailingZeroes) , yBitWidth + 1 );
+					writer.Write( (testVert.z >> trailingZeroes) , zBitWidth + 1 );
+
+				}
+				// Geometry ID fields have zero width; primitive IDs follow the vertices.
+				writer.SkipTo( midpointOffset );
+				writer.Write( (uint32_t)bvh8.bvh.primIdx[firstTri], primBaseIdx ); // Original ID of the first triangle.
+				for (uint32_t j = 1; j < recTris; j++)
+				{
+					const uint32_t triIdx = (uint32_t)bvh8.bvh.primIdx[firstTri + j];
+					writer.Write( triIdx, primIdx );
+				}
+				// Odd count: the last pair's missing tri1 repeats tri0's ID, as Mesa does (always 2 * pairCount - 1 payloads).
+				if (recTris & 1) writer.Write( (uint32_t)bvh8.bvh.primIdx[firstTri + recTris - 1], primIdx );
+
+				writer.SkipTo( 1024 - 29*pairCount );
+				for (int i = pairCount - 1; i >= 0; i--) {
+					const bool hasTri1 = (i * 2 +1) < (int)recTris;
+					writer.Write( 1, 1 ); // prim_range_stop
+					writer.Write( 0, 1 ); // tri1_double_sided
+					writer.Write( hasTri1 ? 1 : 0, 1 ); // tri1_opaque; no geometry flags in tinybvh, so all opaque.
+					for (int j = 0; j < 3; j ++) {
+						writer.Write( hasTri1 ? idxAssign [(i * 2 + 1) * 3 + j] : 0, 4);
+					}
+					writer.Write( 0, 1 ); // tri0_double_sided
+					writer.Write( 1, 1 ); // tri0_opaque
+					for (int j = 0; j < 3; j ++) {
+						writer.Write( idxAssign [(i * 2) * 3 + j], 4);
+					}
+				}
+
+				pairsInRecord[recordCount++] = pairCount;
+				nodeDataPtr += 8;
+				recFirst += recTris;
 			}
 
-			writer.SkipTo( 1024 - 29*pairCount );
-			for (int i = pairCount - 1; i >= 0; i--) {
-				writer.Write( 1, 1 );
-				writer.Write( 0, 1 );
-				writer.Write( 0, 1 );
-				const bool hasTri1 = (i * 2 +1) < (int)tcount;
-				for (int j = 0; j < 3; j ++) {
-					writer.Write( hasTri1 ? idxAssign [(i * 2 + 1) * 3 + j] : 0, 4);
-				}
-				writer.Write( 0, 1 );
-				writer.Write( 0, 1 );
-				for (int j = 0; j < 3; j ++) {
-					writer.Write( idxAssign [(i * 2) * 3 + j], 4);
-				}
-			}
-			
 			// TODO : Currently all triangle pairs will share the same AABB
 			const uint32_t minX = tinybvh_min( uint32_t( floor( (double( child->aabbMin.x ) - double( nodeLo.x )) / double( extentX ) * 4096.0 ) ), 4095u );
 			const uint32_t minY = tinybvh_min( uint32_t( floor( (double( child->aabbMin.y ) - double( nodeLo.y )) / double( extentY ) * 4096.0 ) ), 4095u );
@@ -6623,19 +6651,21 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			const uint32_t maxX = tinybvh_min( uint32_t( ceil( (double( child->aabbMax.x ) - double( nodeLo.x )) / double( extentX ) * 4096.0 ) ) - 1u, 4095u );
 			const uint32_t maxY = tinybvh_min( uint32_t( ceil( (double( child->aabbMax.y ) - double( nodeLo.y )) / double( extentY ) * 4096.0 ) ) - 1u, 4095u );
 			const uint32_t maxZ = tinybvh_min( uint32_t( ceil( (double( child->aabbMax.z ) - double( nodeLo.z )) / double( extentZ ) * 4096.0 ) ) - 1u, 4095u );
-			
-			for (int pair = 0; pair < pairCount; pair++ ){
-				uint32_t size = pair == pairCount - 1 ? 1u : 0u;				
+
+			// Pair index and size are per record: only a record's last pair has size 1, stepping to the next record.
+			for (uint32_t r = 0; r < recordCount; r++) for (uint32_t pair = 0; pair < pairsInRecord[r]; pair++ ){
+				uint32_t size = pair == pairsInRecord[r] - 1 ? 1u : 0u;
 				childInfo[0] = minX | (minY << 12);
 				childInfo[1] = minZ | (maxX << 12) | (0xffu << 24); // All ray mask bits enabled.
-				childInfo[2] = maxY | (maxZ << 12) | (NODE_TRIANGLE << 24) | (size << 28); // Triangle pair, one 128-byte record.
+				childInfo[2] = maxY | (maxZ << 12) |  (((pair & 3) | (pair >= 4 ? 8 : 0)) << 24) | (size << 28); // Triangle pair, one 128-byte record.
 				childInfo += 3;
 				slotsUsed++;
 			}
 		}
 
 		// Empty slots with null values
-		for (int i = 0; i < (8 - slotsUsed); i++)
+		assert( slotsUsed <= 8 );
+		for (uint32_t i = slotsUsed; i < 8; i++)
 		{
 			// Invalid quantized bounds and a zero record size mark an empty child.
 			childInfo[0] = 0xffffffffu, childInfo[1] = 0xfffu, childInfo[2] = 0;
@@ -6651,7 +6681,7 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 		bvh8Data[currentNodeAddr + 1].x = nodeLo.y;
 		bvh8Data[currentNodeAddr + 1].y = nodeLo.z;
 
-		const uint32_t exyzAndChildCount = uint32_t( ex + 127 ) | (uint32_t( ey + 127 ) << 8) | (uint32_t( ez + 127 ) << 16) | (uint32_t( internalChildCount + leafChildCount - 1 ) << 28);
+		const uint32_t exyzAndChildCount = uint32_t( ex + 127 ) | (uint32_t( ey + 127 ) << 8) | (uint32_t( ez + 127 ) << 16) | (uint32_t( slotsUsed - 1 ) << 28);
 		bvh8Data[currentNodeAddr + 1].z = tinybvh_as_float( exyzAndChildCount ); // Exponents in bits 0..23; child count minus one in bits 28..31.
 		bvh8Data[currentNodeAddr + 1].w = tinybvh_as_float( 0x7f ); // Disable oriented bounding boxes.
 	}
