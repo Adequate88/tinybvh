@@ -6962,7 +6962,7 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 		}
 
 		// Prim and Leaf Nodes: EncodeLeaves packs the leaves (one triangle pair each) into records, written from
-		// nodeDataPtr on; the child slots follow its leaf order, each with its own leaf's box.
+		// nodeDataPtr on; the child slots follow its leaf order, each with its own pair's box.
 		if (leafChildCount > 0)
 		{
 			leafBaseIndex = nodeDataPtr * 2;
@@ -6972,12 +6972,26 @@ TEMPLATED void CWBVH8_AMD_HW<Float, Index>::ConvertFrom( const MBVH<8, Float, In
 			// Pair index and size are per record: only a record's last pair has size 1, stepping to the next record.
 			for (uint32_t r = 0, p = 0; r < recordCount; r++) for (uint32_t pair = 0; pair < pairsInRecord[r]; pair++, p++ ){
 				const typename MBVH<8, Float, Index>::MBVHNode* const child = &bvh8.mbvhNode[leafOrder[p]];
-				const uint32_t minX = tinybvh_min( uint32_t( floor( (double( child->aabbMin.x ) - double( nodeLo.x )) / double( extentX ) * 4096.0 ) ), 4095u );
-				const uint32_t minY = tinybvh_min( uint32_t( floor( (double( child->aabbMin.y ) - double( nodeLo.y )) / double( extentY ) * 4096.0 ) ), 4095u );
-				const uint32_t minZ = tinybvh_min( uint32_t( floor( (double( child->aabbMin.z ) - double( nodeLo.z )) / double( extentZ ) * 4096.0 ) ), 4095u );
-				const uint32_t maxX = tinybvh_min( uint32_t( ceil( (double( child->aabbMax.x ) - double( nodeLo.x )) / double( extentX ) * 4096.0 ) ) - 1u, 4095u );
-				const uint32_t maxY = tinybvh_min( uint32_t( ceil( (double( child->aabbMax.y ) - double( nodeLo.y )) / double( extentY ) * 4096.0 ) ) - 1u, 4095u );
-				const uint32_t maxZ = tinybvh_min( uint32_t( ceil( (double( child->aabbMax.z ) - double( nodeLo.z )) / double( extentZ ) * 4096.0 ) ) - 1u, 4095u );
+				// SplitLeafs gives both halves of a split leaf the parent's box, so the pair's box comes from its triangles.
+				bvhvec3 pairMin( BVH_FAR ), pairMax( -BVH_FAR );
+				for (uint32_t t = 0; t < child->triCount; t++)
+				{
+					const uint32_t triIdx = (uint32_t)bvh8.bvh.primIdx[child->firstTri + t];
+					for (uint32_t j = 0; j < 3; j++)
+					{
+						const bvhvec3 v = bvh8.bvh.verts[bvh8.bvh.vertIdx ? bvh8.bvh.vertIdx[triIdx * 3 + j] : triIdx * 3 + j];
+						pairMin = tinybvh_min( pairMin, v ), pairMax = tinybvh_max( pairMax, v );
+					}
+				}
+				// With spatial splits a triangle can reach beyond its leaf; the leaf box clips it.
+				pairMin = tinybvh_max( pairMin, bvhvec3( child->aabbMin ) ), pairMax = tinybvh_min( pairMax, bvhvec3( child->aabbMax ) );
+				const uint32_t minX = tinybvh_min( uint32_t( floor( (double( pairMin.x ) - double( nodeLo.x )) / double( extentX ) * 4096.0 ) ), 4095u );
+				const uint32_t minY = tinybvh_min( uint32_t( floor( (double( pairMin.y ) - double( nodeLo.y )) / double( extentY ) * 4096.0 ) ), 4095u );
+				const uint32_t minZ = tinybvh_min( uint32_t( floor( (double( pairMin.z ) - double( nodeLo.z )) / double( extentZ ) * 4096.0 ) ), 4095u );
+				// Rounded up, clamped at zero for a box flat against the node's minimum (as for interior children).
+				const uint32_t maxX = tinybvh_min( (uint32_t)tinybvh_max( ceil( (double( pairMax.x ) - double( nodeLo.x )) / double( extentX ) * 4096.0 ) - 1.0, 0.0 ), 4095u );
+				const uint32_t maxY = tinybvh_min( (uint32_t)tinybvh_max( ceil( (double( pairMax.y ) - double( nodeLo.y )) / double( extentY ) * 4096.0 ) - 1.0, 0.0 ), 4095u );
+				const uint32_t maxZ = tinybvh_min( (uint32_t)tinybvh_max( ceil( (double( pairMax.z ) - double( nodeLo.z )) / double( extentZ ) * 4096.0 ) - 1.0, 0.0 ), 4095u );
 				uint32_t size = pair == pairsInRecord[r] - 1 ? 1u : 0u;
 				childInfo[0] = minX | (minY << 12);
 				childInfo[1] = minZ | (maxX << 12) | (0xffu << 24); // All ray mask bits enabled.
